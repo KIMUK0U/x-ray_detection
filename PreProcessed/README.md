@@ -332,4 +332,4 @@ A: 処理前後の画像を保存して視覚的に比較するか、Validation�
 
 ## 👤 Author
 
-Kota - University of Tokyo
+Kota - University of Gifu

@@ -291,4 +291,4 @@ A: CLAHEとアンシャープマスクは計算コストが高いため、必要
 
 ## 👤 Author
 
-Kota - University of Tokyo
+Kota - University of Gifu
