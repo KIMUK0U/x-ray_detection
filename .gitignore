@@ -1,0 +1,13 @@
+yolov8l.pt
+yolov8n.pt
+yolov8m.pt
+runs
+ResUNET
+YOLO
+Faster-RCNN
+Data/nodule/Dicom
+Data/nodule/Labels
+Data/non_nodule/Dicom
+Data/non_nodule/Labels
+Data/JSRT_DB_ClinicalData_0613_2018_2.csv
+Data/JSRT_DB_ClinicalData_0613_2018_2.xlsx
