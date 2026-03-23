@@ -8,7 +8,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 from PIL import Image
-from sklearn.metrics import confusion_matrix, roc_curve, auc, precision_score, recall_score, jaccard_score
+# Removed sklearn metrics - using proper segmentation metrics instead
 
 # モデルインポートの柔軟な記述を使用
 try:
@@ -54,13 +54,13 @@ class NpyDataset(Dataset):
     def __getitem__(self, idx):
         img_path = self.img_files[idx]
         lbl_path = self.lbl_files[idx]
-        
+
         img_arr = np.load(img_path).astype(np.float32) # (H, W, C)
         lbl_arr = np.load(lbl_path).astype(np.float32) # (H, W, C)
 
         # ---------------------------------------------
         # データ拡張の適用 (train時のみ)
-        # 
+        #
         # 実装のポイント:
         # - 画像とラベルに同じ変換を適用する
         # - 画像にはINTER_LINEAR、ラベルにはINTER_NEARESTを使用
@@ -73,116 +73,104 @@ class NpyDataset(Dataset):
         # (H, W, C) -> (C, H, W)
         img_tensor = torch.from_numpy(img_arr).permute(2, 0, 1)
         lbl_tensor = torch.from_numpy(lbl_arr).permute(2, 0, 1)
-        
-        return img_tensor, lbl_tensor
+
+        # ファイル名も返す (可視化用)
+        filename = os.path.basename(img_path)
+        return img_tensor, lbl_tensor, filename
 
 # ==========================================
-# 3. 評価ロジック (修正版)
+# 3. 評価ロジック (セグメンテーション用の正しい評価指標)
 # ==========================================
+def dice_score(pred_mask, true_mask, smooth=1e-5):
+    """Dice係数 (F1スコアと等価) を計算する"""
+    intersection = (pred_mask * true_mask).sum()
+    return (2.0 * intersection + smooth) / (pred_mask.sum() + true_mask.sum() + smooth)
+
 def jaccard_index(pred_mask, true_mask, smooth=1e-5):
-    """画像1枚ごとのIoUを計算する"""
+    """IoU (Intersection over Union) を計算する"""
     intersection = (pred_mask * true_mask).sum()
     union = pred_mask.sum() + true_mask.sum() - intersection
     return (intersection + smooth) / (union + smooth)
 
-def evaluate_model(model, data_loader, device, iou_threshold=0.5):
+def pixel_accuracy(pred_mask, true_mask):
+    """ピクセル単位の正解率を計算する"""
+    correct = (pred_mask == true_mask).sum()
+    total = pred_mask.numel()
+    return correct / total
+
+def evaluate_model(model, data_loader, device):
+    """セグメンテーションモデルの評価"""
     model.eval()
-    
-    # 🚨 症例単位のROC/AUC計算用のリスト (修正箇所) 🚨
-    all_scores_img = []   # 画像ごとのスコア (最大予測確率を使用)
-    all_targets_img = []  # 画像ごとのターゲット (異常の有無)
-    
-    # 症例単位の混合行列カウント用
-    true_positives_img = 0
-    false_positives_img = 0
-    false_negatives_img = 0
-    true_negatives_img = 0
+
+    # ピクセル単位の評価指標用
+    total_dice = 0.0
+    total_iou = 0.0
+    total_pixel_acc = 0.0
+
+    # ピクセル単位の混合行列用
+    pixel_tp = 0  # True Positive (正しく陽性と予測)
+    pixel_fp = 0  # False Positive (誤って陽性と予測)
+    pixel_fn = 0  # False Negative (誤って陰性と予測)
+    pixel_tn = 0  # True Negative (正しく陰性と予測)
+
     total_images = 0
 
     with torch.no_grad():
-        for inputs, targets, _ in tqdm(data_loader, desc="Eval "):
+        for batch in tqdm(data_loader, desc="Evaluating"):
+            inputs, targets = batch[0], batch[1]  # Unpack first two items (image, label)
             inputs = inputs.to(device)
-            targets = targets.to(device) # [B, 1, H, W]
+            targets = targets.to(device)  # [B, 1, H, W]
 
             outputs = model(inputs)
-            probs = torch.sigmoid(outputs) 
-            preds_binary = (probs > 0.5).float() # [B, 1, H, W]
-            
+            probs = torch.sigmoid(outputs)
+            preds_binary = (probs > 0.5).float()  # [B, 1, H, W]
 
             for i in range(inputs.size(0)):
-                pred_mask = preds_binary[i].squeeze()
-                true_mask = targets[i].squeeze()
-                prob_map = probs[i].squeeze() # 確率マップ
+                pred_mask = preds_binary[i].squeeze()  # [H, W]
+                true_mask = targets[i].squeeze()       # [H, W]
 
-                # --- 1. ROC/AUC用のスコアとターゲットを抽出 (症例単位) ---
-                has_positive_target = true_mask.sum() > 0 # 画像に異常があるか (ターゲット)
-                
-                # スコアとして、画像内の最大予測確率を使用
-                # 異常の存在に対する確信度が高いほどスコアが高くなる
-                score_img = prob_map.max().item() 
-                
-                all_scores_img.append(score_img)
-                all_targets_img.append(1 if has_positive_target else 0)
+                # セグメンテーション評価指標を計算
+                total_dice += dice_score(pred_mask, true_mask).item()
+                total_iou += jaccard_index(pred_mask, true_mask).item()
+                total_pixel_acc += pixel_accuracy(pred_mask, true_mask).item()
 
-                # --- 2. IoU基準の混合行列計算 (変更なし) ---
-                iou = jaccard_index(pred_mask, true_mask)
-                has_positive_pred = pred_mask.sum() > 0
+                # ピクセル単位の混合行列を計算
+                pred_flat = pred_mask.flatten().cpu().numpy()
+                true_flat = true_mask.flatten().cpu().numpy()
 
-                if iou >= iou_threshold:
-                    if has_positive_target:
-                        true_positives_img += 1 
-                    else:
-                        true_negatives_img += 1 
-                else:
-                    if has_positive_target:
-                        false_negatives_img += 1 
-                    elif has_positive_pred:
-                        false_positives_img += 1 
-                    # else: 両方なし＆IoU低はスキップ
-                
+                pixel_tp += np.sum((pred_flat == 1) & (true_flat == 1))
+                pixel_fp += np.sum((pred_flat == 1) & (true_flat == 0))
+                pixel_fn += np.sum((pred_flat == 0) & (true_flat == 1))
+                pixel_tn += np.sum((pred_flat == 0) & (true_flat == 0))
+
                 total_images += 1
 
-    # --- 評価指標の計算 ---
-    
-    # IoU基準の混合行列 (Image-wise)
-    # ... (混合行列の計算は変更なし) ...
-    tp, fp, fn, tn = true_positives_img, false_positives_img, false_negatives_img, true_negatives_img
-    precision_img = tp / (tp + fp) if (tp + fp) > 0 else 0
-    recall_img = tp / (tp + fn) if (tp + fn) > 0 else 0
+    # 平均値を計算
+    mean_dice = total_dice / total_images
+    mean_iou = total_iou / total_images
+    mean_pixel_acc = total_pixel_acc / total_images
 
-    # 🚨 ROC/AUC (症例単位のスコアとターゲットを使用) 🚨
-    targets_np_img = np.array(all_targets_img)
-    scores_np_img = np.array(all_scores_img)
-    
-    # ターゲットが単一クラスのみの場合の例外処理
-    if len(np.unique(targets_np_img)) > 1:
-        fpr, tpr, _ = roc_curve(targets_np_img, scores_np_img)
-        roc_auc = auc(fpr, tpr)
-    else:
-        # 全症例が同じクラスの場合
-        fpr, tpr, roc_auc = np.array([0, 1]), np.array([0, 1]), 0.5
-    
+    # ピクセル単位のPrecision, Recall, F1を計算
+    pixel_precision = pixel_tp / (pixel_tp + pixel_fp) if (pixel_tp + pixel_fp) > 0 else 0
+    pixel_recall = pixel_tp / (pixel_tp + pixel_fn) if (pixel_tp + pixel_fn) > 0 else 0
+    pixel_f1 = 2 * (pixel_precision * pixel_recall) / (pixel_precision + pixel_recall) if (pixel_precision + pixel_recall) > 0 else 0
+
     metrics = {
-        "IoU (Pixel Avg, Reference)": 0.0, # ピクセルIoUは不要のため省略または0
-        "CM (Image-wise)": np.array([[tn, fp], [fn, tp]]),
-        "TN_img": tn, "FP_img": fp, "FN_img": fn, "TP_img": tp,
-        "Precision (Image)": precision_img,
-        "Recall (Image)": recall_img,
         "Total Images": total_images,
-        "ROC Curve (FPR, TPR)": (fpr, tpr),
-        "AUC (Image-wise)": roc_auc # 項目名を変更
+        "Mean Dice Score": mean_dice,
+        "Mean IoU (Jaccard)": mean_iou,
+        "Mean Pixel Accuracy": mean_pixel_acc,
+        "Pixel-wise Precision": pixel_precision,
+        "Pixel-wise Recall": pixel_recall,
+        "Pixel-wise F1 Score": pixel_f1,
+        "Pixel TP": pixel_tp,
+        "Pixel FP": pixel_fp,
+        "Pixel FN": pixel_fn,
+        "Pixel TN": pixel_tn,
     }
     return metrics
 
-# --- ROC曲線プロット ---
-def plot_roc_curve(fpr, tpr, roc_auc):
-    plt.figure()
-    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.4f})')
-    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-    plt.xlim([0.0, 1.0]); plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate (FPR)'); plt.ylabel('True Positive Rate (TPR)')
-    plt.title('Receiver Operating Characteristic (ROC) Curve')
-    plt.legend(loc="lower right"); plt.grid(True); plt.show()
+# ROC curve plotting removed - not appropriate for segmentation tasks
 
 # --- ラベルと予測の並列画像プロット ---
 def plot_predictions(model, dataset, device, num_images=5):
@@ -255,28 +243,31 @@ def main():
         print(f"❌ Error loading model: {e}"); return
 
     # 評価の実行
-    print("\n🔬 Starting evaluation on Test Data (Image-wise CM, IoU Thresh=0.5)...")
+    print("\n🔬 Starting evaluation on Test Data...")
     metrics = evaluate_model(model, test_loader, DEVICE)
-    
-    # 結果の表示
-    print("\n" + "="*50)
-    print("      Segmentation Model Evaluation Metrics")
-    print("          (IoU Threshold: 0.5)")
-    print("="*50)
-    print(f"Total Images: {metrics['Total Images']}")
-    print(f"AUC (Image-wise, Max Prob): {metrics['AUC (Image-wise)']:.4f}") # 項目名を修正
-    
-    print("\n--- Confusion Matrix (Image-wise, by IoU) ---")
-    print(f"True Positives (TP): {metrics['TP_img']}")
-    print(f"False Positives (FP): {metrics['FP_img']}")
-    print(f"False Negatives (FN): {metrics['FN_img']}")
-    print(f"True Negatives (TN): {metrics['TN_img']}")
-    print("---------------------------------------------")
-    print(f"Precision (適合率): {metrics['Precision (Image)']:.4f}")
-    print(f"Recall (再現率): {metrics['Recall (Image)']:.4f}")
 
-    # ROC曲線のプロット
-    plot_roc_curve(metrics["ROC Curve (FPR, TPR)"][0], metrics["ROC Curve (FPR, TPR)"][1], metrics['AUC (Image-wise)'])
+    # 結果の表示
+    print("\n" + "="*60)
+    print("      Segmentation Model Evaluation Metrics")
+    print("="*60)
+    print(f"Total Images: {metrics['Total Images']}")
+
+    print("\n--- Image-Level Metrics (Average per Image) ---")
+    print(f"Mean Dice Score (F1):      {metrics['Mean Dice Score']:.4f}")
+    print(f"Mean IoU (Jaccard Index):  {metrics['Mean IoU (Jaccard)']:.4f}")
+    print(f"Mean Pixel Accuracy:       {metrics['Mean Pixel Accuracy']:.4f}")
+
+    print("\n--- Pixel-Level Metrics (Across All Pixels) ---")
+    print(f"Precision: {metrics['Pixel-wise Precision']:.4f}")
+    print(f"Recall:    {metrics['Pixel-wise Recall']:.4f}")
+    print(f"F1 Score:  {metrics['Pixel-wise F1 Score']:.4f}")
+
+    print("\n--- Pixel-wise Confusion Matrix ---")
+    print(f"True Positives (TP):  {metrics['Pixel TP']:,}")
+    print(f"False Positives (FP): {metrics['Pixel FP']:,}")
+    print(f"False Negatives (FN): {metrics['Pixel FN']:,}")
+    print(f"True Negatives (TN):  {metrics['Pixel TN']:,}")
+    print("="*60)
     
     # 実際のデータと予測の視覚化
     print("\n🖼️ Displaying sample predictions...")
